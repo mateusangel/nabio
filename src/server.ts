@@ -13,14 +13,16 @@ const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERV
 
 function isAllowedOrigin(origin: string | undefined): boolean {
   if (!origin) return true;
-  if (origin === frontendOrigin) return true;
-  if (process.env.NODE_ENV !== 'production') {
-    try {
-      const url = new URL(origin);
-      return ['localhost', '127.0.0.1'].includes(url.hostname);
-    } catch {
-      return false;
-    }
+  const allowed = frontendOrigin.split(',').map(o => o.trim());
+  if (allowed.includes(origin)) return true;
+  try {
+    const url = new URL(origin);
+    // Allow any localhost, any vercel.app domain, and render.com
+    if (['localhost', '127.0.0.1'].includes(url.hostname)) return true;
+    if (url.hostname.endsWith('.vercel.app')) return true;
+    if (url.hostname.endsWith('.onrender.com')) return true;
+  } catch {
+    return false;
   }
   return false;
 }
@@ -31,7 +33,7 @@ app.use((request, response, next) => {
   if (isAllowedOrigin(origin)) response.header('Access-Control-Allow-Origin', origin || frontendOrigin);
   response.header('Vary', 'Origin');
   response.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  response.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  response.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
   if (request.method === 'OPTIONS') {
     response.sendStatus(204);
     return;
@@ -220,6 +222,24 @@ function serializeBioSite(record: {
   };
 }
 
+function serializePublicBioSite(record: Parameters<typeof serializeBioSite>[0]) {
+  const site = serializeBioSite(record) as BioSitePayload;
+  const {
+    leads,
+    bookings,
+    analyticsEvents,
+    editKey,
+    clientEditKey,
+    clientAccessPassword,
+    clientAccessEmail,
+    clientAccessLevel,
+    clientPermission,
+    clientAccessMode,
+    ...publicSite
+  } = site;
+  return publicSite;
+}
+
 async function toRecordData(payload: BioSitePayload) {
   const theme = payload.theme && typeof payload.theme === 'object' ? payload.theme as BioSitePayload : {};
   const content = { ...payload };
@@ -244,88 +264,320 @@ async function toRecordData(payload: BioSitePayload) {
   };
 }
 
-async function removeBioSiteStorage(media: Array<{ storageKey: string | null; type: string }>, bioSiteIds: string[] = []) {
+function validateBioSiteFeatures(payload: BioSitePayload): string | null {
+  const events = payload.events;
+  if (events !== undefined && events !== null) {
+    if (!Array.isArray(events)) return 'events deve ser uma lista.';
+    if (events.length > 2) return 'Cada Bio Site pode ter no máximo 2 eventos.';
+
+    for (const [index, value] of events.entries()) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return `O evento ${index + 1} é inválido.`;
+      }
+      const event = value as Record<string, unknown>;
+      const eventDate = typeof event.date === 'string' ? event.date : '';
+      const parsedDate = Date.parse(`${eventDate}T00:00:00.000Z`);
+      if (
+        typeof event.title !== 'string' || !event.title.trim() ||
+        typeof event.description !== 'string' || !event.description.trim() ||
+        typeof event.imageUrl !== 'string' || !event.imageUrl.trim() ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(eventDate) ||
+        !Number.isFinite(parsedDate) || new Date(parsedDate).toISOString().slice(0, 10) !== eventDate
+      ) {
+        return `O evento ${index + 1} precisa de título, foto, data válida e descrição.`;
+      }
+    }
+  }
+
+  const openingSchedules = payload.openingSchedules;
+  if (openingSchedules !== undefined && openingSchedules !== null) {
+    if (!Array.isArray(openingSchedules)) return 'openingSchedules deve ser uma lista.';
+    for (const [index, value] of openingSchedules.entries()) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return `O horário ${index + 1} é inválido.`;
+      }
+      const schedule = value as Record<string, unknown>;
+      if (
+        typeof schedule.title !== 'string' || !schedule.title.trim() ||
+        !Array.isArray(schedule.days) || schedule.days.length === 0
+      ) {
+        return `O horário ${index + 1} precisa de título e ao menos um dia.`;
+      }
+      const seenDays = new Set<number>();
+      for (const dayValue of schedule.days) {
+        if (!dayValue || typeof dayValue !== 'object' || Array.isArray(dayValue)) {
+          return `Os dias do horário ${index + 1} são inválidos.`;
+        }
+        const day = dayValue as Record<string, unknown>;
+        const openTime = typeof day.openTime === 'string' ? day.openTime : '';
+        const closeTime = typeof day.closeTime === 'string' ? day.closeTime : '';
+        if (
+          !Number.isInteger(day.day) || Number(day.day) < 0 || Number(day.day) > 6 ||
+          !/^([01]\d|2[0-3]):[0-5]\d$/.test(openTime) ||
+          !/^([01]\d|2[0-3]):[0-5]\d$/.test(closeTime) || openTime >= closeTime ||
+          seenDays.has(Number(day.day))
+        ) {
+          return `Os dias e horários do horário ${index + 1} são inválidos.`;
+        }
+        seenDays.add(Number(day.day));
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractStorageKeyFromUrl(url: string | null | undefined, supabaseUrl: string): { bucket: string; key: string } | null {
+  if (!url) return null;
+  try {
+    // Supabase public URL pattern: {supabaseUrl}/storage/v1/object/public/{bucket}/{key}
+    const base = `${supabaseUrl}/storage/v1/object/public/`;
+    if (!url.startsWith(base)) return null;
+    const rest = url.slice(base.length);
+    const slashIdx = rest.indexOf('/');
+    if (slashIdx < 0) return null;
+    const bucket = rest.slice(0, slashIdx);
+    const key = decodeURIComponent(rest.slice(slashIdx + 1));
+    return { bucket, key };
+  } catch {
+    return null;
+  }
+}
+
+/** List all file paths in a Supabase Storage bucket under a given prefix (recursive). */
+async function listStorageFiles(supabaseUrl: string, serviceRoleKey: string, bucket: string, prefix: string): Promise<string[]> {
+  const paths: string[] = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const res = await fetch(`${supabaseUrl}/storage/v1/object/list/${encodeURIComponent(bucket)}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${serviceRoleKey}`, apikey: serviceRoleKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prefix, limit, offset, search: '' }),
+    });
+    if (!res.ok) break;
+    const items = await res.json() as Array<{ name: string; id: string | null }>;
+    if (!Array.isArray(items) || items.length === 0) break;
+    for (const item of items) {
+      if (item.id) {
+        // item.id means it's a file
+        paths.push(prefix ? `${prefix}/${item.name}` : item.name);
+      } else {
+        // item.id is null/missing → it's a folder; recurse into it
+        const subPaths = await listStorageFiles(supabaseUrl, serviceRoleKey, bucket, prefix ? `${prefix}/${item.name}` : item.name);
+        paths.push(...subPaths);
+      }
+    }
+    if (items.length < limit) break;
+    offset += limit;
+  }
+  return paths;
+}
+
+/** Delete exact file paths from a Supabase Storage bucket in batches. */
+async function deleteStorageFiles(supabaseUrl: string, serviceRoleKey: string, bucket: string, filePaths: string[]): Promise<void> {
+  if (filePaths.length === 0) return;
+  const unique = [...new Set(filePaths)];
+  // Supabase accepts up to 1000 paths per request; /remove takes exact file paths
+  for (let i = 0; i < unique.length; i += 1000) {
+    const batch = unique.slice(i, i + 1000);
+    const res = await fetch(`${supabaseUrl}/storage/v1/object/${encodeURIComponent(bucket)}/remove`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${serviceRoleKey}`, apikey: serviceRoleKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prefixes: batch }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.error(`Falha ao excluir arquivos do bucket ${bucket}: ${res.status} ${text}`);
+    }
+  }
+}
+
+async function removeBioSiteStorage(
+  media: Array<{ storageKey: string | null; type: string }>,
+  bioSiteIds: string[] = [],
+  directUrls: Array<string | null | undefined> = [],
+  ownerUserId?: string | null,
+) {
   const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERVICE_ROLE_KEY;
   if (!supabaseUrl || !serviceRoleKey) throw new Error('Storage do Supabase não está configurado no backend.');
+
+  // Collect exact file paths per bucket
   const grouped = new Map<string, string[]>();
+
+  const addPath = (bucket: string, path: string) => {
+    grouped.set(bucket, [...(grouped.get(bucket) || []), path]);
+  };
+
+  // 1. Explicit storageKey entries from BioSiteMedia table
   for (const item of media) {
     if (!item.storageKey) continue;
     const bucket = item.type === 'VIDEO' ? 'Video' : 'Foto';
-    grouped.set(bucket, [...(grouped.get(bucket) || []), item.storageKey]);
+    addPath(bucket, item.storageKey);
   }
+
+  // 2. Direct URL files (avatarUrl, logoUrl, coverImageUrl, introVideoUrl, backgroundImageUrl, backgroundVideoUrl)
+  for (const url of directUrls) {
+    const parsed = extractStorageKeyFromUrl(url, supabaseUrl);
+    if (!parsed) continue;
+    addPath(parsed.bucket, parsed.key);
+  }
+
+  // 3. Folder-level cleanup: list all files under the owner's folder for each siteId
+  //    Upload path format: {safeSegment(userId)}/{safeSegment('biosites/{siteId}/subfolder')}/{uuid-file}
+  //    safeSegment replaces non-alphanumeric with '-', so the prefix becomes:
+  //    {userId-safe}/biosites-{siteId}-{subfolder}/...
+  //    We list the entire owner folder and filter by siteId substring, OR list known subfolders.
   for (const siteId of bioSiteIds) {
-    for (const bucket of ['Foto', 'Video']) {
-      grouped.set(bucket, [...(grouped.get(bucket) || []), `biosites/${siteId}`]);
+    for (const bucket of ['Foto', 'Video'] as const) {
+      // Strategy A: if we know the ownerId, list under their root folder and filter by siteId
+      if (ownerUserId) {
+        const safeUserId = ownerUserId.replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-').slice(0, 80);
+        const rootFiles = await listStorageFiles(supabaseUrl, serviceRoleKey, bucket, safeUserId).catch(() => []);
+        const safeSiteId = siteId.replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-');
+        for (const path of rootFiles) {
+          if (path.includes(safeSiteId)) addPath(bucket, path);
+        }
+      } else {
+        // Strategy B: no ownerId known — try common subfolder patterns used by the frontend
+        const safeSiteId = siteId.replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-');
+        for (const sub of ['perfil', 'aparencia', 'servicos', 'produtos', 'catalogo']) {
+          const prefix = `biosites-${safeSiteId}-${sub}`;
+          // We don't know the userId segment, so list the bucket root first
+          const rootItems = await listStorageFiles(supabaseUrl, serviceRoleKey, bucket, '').catch(() => []);
+          for (const path of rootItems) {
+            if (path.includes(safeSiteId)) addPath(bucket, path);
+          }
+          break; // avoid duplicate scans — one scan of root is enough
+        }
+      }
     }
   }
-  await Promise.all([...grouped.entries()].map(async ([bucket, prefixes]) => {
-    const storageResponse = await fetch(`${supabaseUrl}/storage/v1/object/${encodeURIComponent(bucket)}/remove`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${serviceRoleKey}`, apikey: serviceRoleKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prefixes: [...new Set(prefixes)] }),
+
+  if (grouped.size === 0) return;
+
+  await Promise.all([...grouped.entries()].map(async ([bucket, paths]) => {
+    await deleteStorageFiles(supabaseUrl, serviceRoleKey, bucket, paths).catch(err => {
+      console.error(`Não foi possível limpar o bucket ${bucket}:`, err);
     });
-    if (!storageResponse.ok) throw new Error(`Não foi possível limpar o bucket ${bucket}: ${storageResponse.status} ${await storageResponse.text()}`);
   }));
+}
+
+// Upsert a ClientAccount for a bio site when credentials are set by the admin.
+async function upsertClientAccountForBioSite(bioSiteId: string, email: string, passwordHash: string, siteName: string): Promise<void> {
+  const normalizedEmail = email.trim().toLowerCase();
+  try {
+    let account = await prisma.clientAccount.findUnique({ where: { email: normalizedEmail } });
+    if (!account) {
+      account = await prisma.clientAccount.create({
+        data: { name: siteName, email: normalizedEmail, passwordHash },
+      });
+    } else {
+      // Update password hash in case it changed
+      await prisma.clientAccount.update({
+        where: { id: account.id },
+        data: { passwordHash },
+      });
+    }
+    // Link this bio site to the account if not already linked
+    await prisma.bioSite.update({
+      where: { id: bioSiteId },
+      data: { clientAccountId: account.id },
+    });
+  } catch (error) {
+    console.error('upsertClientAccountForBioSite failed (non-critical):', error);
+  }
 }
 
 async function authenticateClientAccount(email: string, password: string, clientKey?: string) {
   const normalizedEmail = email.trim().toLowerCase();
+
+  // Load all bio sites to find matching credentials
   const records = await prisma.bioSite.findMany();
+
+  // If a clientKey was provided, find the bio site that owns that key
   const keyRecord = clientKey
     ? records.find(item => {
         const content = item.content && typeof item.content === 'object' ? item.content as BioSitePayload : {};
         return content.editKey === clientKey || content.clientEditKey === clientKey;
       })
     : undefined;
+
+  // Find the bio site whose clientAccessEmail matches — prefer keyRecord
   const legacyRecord = keyRecord || records.find(item => {
-    const content = item.content && typeof item.content === 'object' ? item.content as BioSitePayload : {};
-    const storedEmail = item.clientAccessEmail || (typeof content.clientAccessEmail === 'string' ? content.clientAccessEmail : '');
+    const storedEmail = item.clientAccessEmail || '';
     return storedEmail.toLowerCase() === normalizedEmail;
   });
+
+  // Look up existing ClientAccount
   let account = await prisma.clientAccount.findUnique({ where: { email: normalizedEmail } });
 
   if (!account) {
-    const content = legacyRecord?.content && typeof legacyRecord.content === 'object' ? legacyRecord.content as BioSitePayload : {};
-    const storedEmail = legacyRecord?.clientAccessEmail || (typeof content.clientAccessEmail === 'string' ? content.clientAccessEmail : '');
-    const legacyPasswordValid = Boolean(legacyRecord && storedEmail.toLowerCase() === normalizedEmail && (
+    // Try legacy / direct credential stored on the BioSite record
+    if (!legacyRecord) return null;
+
+    const legacyEmail = (legacyRecord.clientAccessEmail || '').toLowerCase();
+    if (legacyEmail !== normalizedEmail) return null;
+
+    const legacyContent = legacyRecord.content && typeof legacyRecord.content === 'object' ? legacyRecord.content as BioSitePayload : {};
+
+    const passwordValid =
       legacyRecord.clientAccessPasswordHash
         ? verifyClientPassword(password, legacyRecord.clientAccessPasswordHash)
-        : content.clientAccessPassword === password
-    ));
-    if (!legacyRecord || !legacyPasswordValid) return null;
-    account = await prisma.clientAccount.create({ data: { name: legacyRecord.name, email: normalizedEmail, passwordHash: legacyRecord.clientAccessPasswordHash || hashClientPassword(password) } });
+        : (typeof legacyContent.clientAccessPassword === 'string' && legacyContent.clientAccessPassword === password);
+
+    if (!passwordValid) return null;
+
+    // Promote legacy record to a ClientAccount
+    const passwordHash = legacyRecord.clientAccessPasswordHash || hashClientPassword(password);
+    account = await prisma.clientAccount.create({
+      data: { name: legacyRecord.name, email: normalizedEmail, passwordHash },
+    });
+
+    // Link all bio sites with this email to the new account
     for (const record of records) {
-      const recordContent = record.content && typeof record.content === 'object' ? record.content as BioSitePayload : {};
-      const recordEmail = record.clientAccessEmail || (typeof recordContent.clientAccessEmail === 'string' ? recordContent.clientAccessEmail : '');
-      if (recordEmail.toLowerCase() === normalizedEmail && !record.clientAccountId) {
+      const recordEmail = (record.clientAccessEmail || '').toLowerCase();
+      if (recordEmail === normalizedEmail && !record.clientAccountId) {
         await prisma.bioSite.update({ where: { id: record.id }, data: { clientAccountId: account.id } });
       }
     }
-  } else if (!verifyClientPassword(password, account.passwordHash)) {
-    return null;
-  }
+  } else {
+    // Verify password against the ClientAccount
+    if (!verifyClientPassword(password, account.passwordHash)) return null;
 
-  for (const record of records) {
-    const recordContent = record.content && typeof record.content === 'object' ? record.content as BioSitePayload : {};
-    const recordEmail = record.clientAccessEmail || (typeof recordContent.clientAccessEmail === 'string' ? recordContent.clientAccessEmail : '');
-    if (recordEmail.toLowerCase() === normalizedEmail && record.clientAccountId !== account.id) {
-      await prisma.bioSite.update({ where: { id: record.id }, data: { clientAccountId: account.id } });
+    // Sync any unlinked bio sites with this email to the account
+    for (const record of records) {
+      const recordEmail = (record.clientAccessEmail || '').toLowerCase();
+      if (recordEmail === normalizedEmail && record.clientAccountId !== account.id) {
+        await prisma.bioSite.update({ where: { id: record.id }, data: { clientAccountId: account.id } });
+      }
     }
   }
 
+  // If a specific key was provided, verify it belongs to this account's email
   if (keyRecord && keyRecord.clientAccountId !== account.id) {
-    const content = keyRecord.content && typeof keyRecord.content === 'object' ? keyRecord.content as BioSitePayload : {};
-    const keyEmail = keyRecord.clientAccessEmail || (typeof content.clientAccessEmail === 'string' ? content.clientAccessEmail : '');
-    if (keyEmail.toLowerCase() !== normalizedEmail) return null;
+    const keyEmail = (keyRecord.clientAccessEmail || '').toLowerCase();
+    if (keyEmail !== normalizedEmail) return null;
     await prisma.bioSite.update({ where: { id: keyRecord.id }, data: { clientAccountId: account.id } });
   }
 
-  const linkedSites = await prisma.bioSite.findMany({ where: { clientAccountId: account.id, status: { notIn: ['disabled', 'archived'] } }, orderBy: { updatedAt: 'desc' } });
-  const selectedSite = clientKey ? linkedSites.find(site => site.id === keyRecord?.id) : linkedSites[0];
+  // Find the best bio site to return
+  const linkedSites = await prisma.bioSite.findMany({
+    where: { clientAccountId: account.id, status: { notIn: ['disabled', 'archived'] } },
+    orderBy: { updatedAt: 'desc' },
+  });
+
+  const selectedSite = keyRecord
+    ? (linkedSites.find(s => s.id === keyRecord.id) || linkedSites[0])
+    : linkedSites[0];
+
   if (!selectedSite) return null;
+
   return { account, site: selectedSite, sessionToken: await createClientSession(account.id) };
 }
+
+// ─── Bio Sites ────────────────────────────────────────────────────────────────
 
 app.get('/api/bio-sites', requireActiveUser, async (request: AuthenticatedRequest, response) => {
   const page = Math.max(Number(request.query.page) || 1, 1);
@@ -366,6 +618,7 @@ app.get('/api/bio-sites', requireActiveUser, async (request: AuthenticatedReques
   }
 });
 
+// IMPORTANT: specific routes (/slug/:slug and /client/:key) must come BEFORE the generic /:id route
 app.get('/api/bio-sites/slug/:slug', async (request, response) => {
   try {
     const record = await prisma.bioSite.findUnique({ where: { slug: request.params.slug } });
@@ -377,9 +630,40 @@ app.get('/api/bio-sites/slug/:slug', async (request, response) => {
       response.status(404).json({ error: 'Este Bio Site está desativado.' });
       return;
     }
-    response.json(serializeBioSite(record));
+    response.json(serializePublicBioSite(record));
   } catch (error) {
     response.status(500).json({ error: 'Não foi possível carregar o Bio Site.', detail: String(error) });
+  }
+});
+
+// GET bio site by client edit key — requires authentication first via /authenticate sub-route
+// Returns 401 so the frontend knows to redirect to the client login form.
+// The actual site data is returned after authenticating via POST /api/bio-sites/client/:key/authenticate
+app.get('/api/bio-sites/client/:key', async (request, response) => {
+  try {
+    // Check if caller already has a valid client session token
+    const authorization = request.header('authorization');
+    if (authorization?.startsWith('Bearer client_')) {
+      const session = await prisma.clientSession.findUnique({
+        where: { tokenHash: hashClientSession(authorization.slice('Bearer '.length)) },
+        include: { account: { include: { bioSites: true } } },
+      });
+      if (session && session.expiresAt > new Date() && session.account.status === 'active') {
+        // Find the bio site linked to this account that matches the key
+        const clientKey = request.params.key;
+        const site = session.account.bioSites.find(s => {
+          const content = s.content && typeof s.content === 'object' ? s.content as BioSitePayload : {};
+          return content.editKey === clientKey || content.clientEditKey === clientKey;
+        }) || session.account.bioSites[0];
+        if (site && site.status !== 'disabled' && site.status !== 'archived') {
+          return response.json(serializeBioSite(site));
+        }
+      }
+    }
+    // No valid session — tell the frontend to show the login form
+    response.status(401).json({ error: 'Autenticação de cliente obrigatória.' });
+  } catch (error) {
+    response.status(500).json({ error: 'Não foi possível verificar a sessão do cliente.', detail: String(error) });
   }
 });
 
@@ -398,6 +682,8 @@ app.get('/api/bio-sites/:id', requireActiveUser, async (request: AuthenticatedRe
 
 app.post('/api/bio-sites', requireActiveUser, async (request: AuthenticatedRequest, response) => {
   const payload = request.body as BioSitePayload;
+  const featureError = validateBioSiteFeatures(payload);
+  if (featureError) { response.status(400).json({ error: featureError }); return; }
   const id = typeof payload.id === 'string' && payload.id ? payload.id : randomUUID();
   const data = await toRecordData(payload);
   if (!data.slug || !data.name) {
@@ -407,6 +693,12 @@ app.post('/api/bio-sites', requireActiveUser, async (request: AuthenticatedReque
 
   try {
     const record = await prisma.bioSite.create({ data: { id, ownerId: request.userId, ...data } });
+
+    // Proactively create/link a ClientAccount when credentials are provided
+    if (data.clientAccessEmail && data.clientAccessPasswordHash) {
+      await upsertClientAccountForBioSite(record.id, data.clientAccessEmail, data.clientAccessPasswordHash, data.name);
+    }
+
     response.status(201).json(serializeBioSite(record));
   } catch (error) {
     response.status(409).json({ error: 'Não foi possível criar o Bio Site.', detail: String(error) });
@@ -415,6 +707,8 @@ app.post('/api/bio-sites', requireActiveUser, async (request: AuthenticatedReque
 
 app.put('/api/bio-sites/:id', requireClientOrOwner, async (request: AuthenticatedRequest, response) => {
   const payload = request.body as BioSitePayload;
+  const featureError = validateBioSiteFeatures(payload);
+  if (featureError) { response.status(400).json({ error: featureError }); return; }
   const data = await toRecordData(payload);
   if (!data.slug || !data.name) {
     response.status(400).json({ error: 'name e slug são obrigatórios.' });
@@ -425,6 +719,14 @@ app.put('/api/bio-sites/:id', requireClientOrOwner, async (request: Authenticate
     const existing = await findEditableBioSite(request, request.params.id);
     if (!existing) { response.status(404).json({ error: 'Bio Site não encontrado.' }); return; }
     const record = await prisma.bioSite.update({ where: { id: existing.id }, data });
+
+    // Proactively create/link a ClientAccount when credentials are provided or updated
+    const emailToUse = data.clientAccessEmail || existing.clientAccessEmail;
+    const hashToUse = data.clientAccessPasswordHash || existing.clientAccessPasswordHash;
+    if (emailToUse && hashToUse) {
+      await upsertClientAccountForBioSite(record.id, emailToUse, hashToUse, data.name || existing.name);
+    }
+
     response.json(serializeBioSite(record));
   } catch (error) {
     response.status(404).json({ error: 'Não foi possível atualizar o Bio Site.', detail: String(error) });
@@ -435,118 +737,37 @@ app.delete('/api/bio-sites/:id', requireActiveUser, async (request: Authenticate
   try {
     const site = await findEditableBioSite(request, request.params.id);
     if (!site) { response.status(404).json({ error: 'Bio Site não encontrado.' }); return; }
+
+    // Collect all media table entries
     const media = await prisma.bioSiteMedia.findMany({ where: { bioSiteId: site.id }, select: { storageKey: true, type: true } });
+
+    // Collect direct URL fields stored on the bio site record itself
+    const directUrls: Array<string | null | undefined> = [
+      site.avatarUrl,
+      site.logoUrl,
+      site.coverImageUrl,
+      site.introVideoUrl,
+      site.backgroundImageUrl,
+      site.backgroundVideoUrl,
+    ];
+
+    // Delete DB record first (cascades bookings, leads, access keys, media rows)
     await prisma.bioSite.delete({ where: { id: site.id } });
+
+    // Best-effort storage cleanup (never fails the request)
     try {
-      await removeBioSiteStorage(media, [site.id]);
+      await removeBioSiteStorage(media, [site.id], directUrls, site.ownerId);
     } catch (storageError) {
-      console.error(`Bio Site ${site.id} excluído, mas a limpeza do Storage falhou:`, storageError);
+      console.error(`Bio Site ${site.id} excluído do DB, mas a limpeza do Storage falhou:`, storageError);
     }
+
     response.status(204).send();
   } catch (error) {
     response.status(500).json({ error: 'Não foi possível excluir o Bio Site.', detail: String(error) });
   }
 });
 
-app.get('/api/analytics/events', async (request, response) => {
-  const bioSiteId = String(request.query.bioSiteId || '');
-  if (!bioSiteId) {
-    response.status(400).json({ error: 'bioSiteId é obrigatório.' });
-    return;
-  }
-
-  try {
-    const record = await prisma.bioSite.findUnique({ where: { id: bioSiteId } });
-    const content = record?.content && typeof record.content === 'object' ? record.content as BioSitePayload : {};
-    response.json(Array.isArray(content.analyticsEvents) ? content.analyticsEvents : []);
-  } catch (error) {
-    response.status(500).json({ error: 'Não foi possível carregar os eventos.', detail: String(error) });
-  }
-});
-
-app.post('/api/analytics/events', async (request, response) => {
-  const { bioSiteId, type, targetId, targetLabel, device, referrer } = request.body || {};
-  if (typeof bioSiteId !== 'string' || typeof type !== 'string' || typeof device !== 'string') {
-    response.status(400).json({ error: 'bioSiteId, type e device são obrigatórios.' });
-    return;
-  }
-
-  try {
-    const record = await prisma.bioSite.findUnique({ where: { id: bioSiteId } });
-    if (!record) {
-      response.status(404).json({ error: 'Bio Site não encontrado.' });
-      return;
-    }
-
-    const content = record.content && typeof record.content === 'object' ? record.content as BioSitePayload : {};
-    const currentEvents = Array.isArray(content.analyticsEvents) ? content.analyticsEvents : [];
-    const event = {
-      id: randomUUID(),
-      bioSiteId,
-      type,
-      targetId,
-      targetLabel,
-      device,
-      referrer,
-      timestamp: new Date().toISOString(),
-    };
-    const nextEvents = [...currentEvents, event].slice(-5000);
-    await prisma.bioSite.update({
-      where: { id: bioSiteId },
-      data: { content: { ...content, analyticsEvents: nextEvents } as Prisma.InputJsonValue },
-    });
-    response.status(201).json(event);
-  } catch (error) {
-    response.status(500).json({ error: 'Não foi possível registrar o evento.', detail: String(error) });
-  }
-});
-
-app.post('/api/pix/payload', (request, response) => {
-  const { pixKey, receiverName, city, amount, txId, description } = request.body || {};
-  if (typeof pixKey !== 'string' || !pixKey.trim()) {
-    response.status(400).json({ error: 'pixKey é obrigatório' });
-    return;
-  }
-
-  response.json({ payload: generatePixPayload({ pixKey, receiverName, city, amount, txId, description }) });
-});
-
-app.post('/api/wifi/payload', (request, response) => {
-  const { ssid, password, securityType, hidden } = request.body || {};
-  if (typeof ssid !== 'string' || !ssid.trim()) {
-    response.status(400).json({ error: 'ssid é obrigatório' });
-    return;
-  }
-
-  response.json({ payload: generateWifiPayload({ ssid, password, securityType, hidden }) });
-});
-
-app.listen(port, () => {
-  console.log(`NaBio backend running on http://localhost:${port}`);
-});
-
-app.get('/api/bio-sites/client/:key', async (request, response) => {
-  response.status(401).json({ error: 'Autenticação de cliente obrigatória.' });
-});
-
-app.post('/api/client-authenticate', async (request, response) => {
-  const { email, password } = request.body || {};
-  if (typeof email !== 'string' || typeof password !== 'string') {
-    response.status(400).json({ error: 'E-mail e senha são obrigatórios.' });
-    return;
-  }
-  try {
-    const result = await authenticateClientAccount(email, password);
-    if (!result) {
-      response.status(401).json({ error: 'E-mail ou senha do cliente inválidos.' });
-      return;
-    }
-    const content = result.site.content && typeof result.site.content === 'object' ? result.site.content as BioSitePayload : {};
-    response.json({ site: serializeBioSite(result.site), clientKey: content.clientEditKey || content.editKey, sessionToken: result.sessionToken, clientAccount: { id: result.account.id, name: result.account.name, email: result.account.email } });
-  } catch (error) {
-    response.status(500).json({ error: 'Não foi possível autenticar o cliente.', detail: String(error) });
-  }
-});
+// ─── Media ────────────────────────────────────────────────────────────────────
 
 app.post('/api/bio-sites/:id/media', requireClientOrOwner, async (request: AuthenticatedRequest, response) => {
   const { type, usage, url, storageKey, mimeType, fileSize, width, height, durationSeconds, sortOrder } = request.body || {};
@@ -593,6 +814,24 @@ app.get('/api/bio-sites/:id/media', async (request, response) => {
   }
 });
 
+app.delete('/api/bio-sites/:id/media', requireClientOrOwner, async (request: AuthenticatedRequest, response) => {
+  const url = String(request.query.url || '');
+  if (!url) { response.status(400).json({ error: 'url é obrigatório.' }); return; }
+  try {
+    const site = await findEditableBioSite(request, request.params.id);
+    if (!site) { response.status(404).json({ error: 'Bio Site não encontrado.' }); return; }
+    const media = await prisma.bioSiteMedia.findFirst({ where: { bioSiteId: site.id, url } });
+    if (!media) { response.status(404).json({ error: 'Mídia não encontrada.' }); return; }
+    await removeBioSiteStorage([{ storageKey: media.storageKey, type: media.type }]);
+    await prisma.bioSiteMedia.delete({ where: { id: media.id } });
+    response.status(204).send();
+  } catch (error) {
+    response.status(500).json({ error: 'Não foi possível remover a mídia.', detail: String(error) });
+  }
+});
+
+// ─── Bookings ─────────────────────────────────────────────────────────────────
+
 app.get('/api/bio-sites/:id/bookings', async (request, response) => {
   try {
     const record = await prisma.bioSite.findUnique({ where: { id: request.params.id } });
@@ -636,47 +875,275 @@ app.patch('/api/bio-sites/:id/bookings/:bookingId', async (request, response) =>
       const existing = leads.find(lead => String(lead.whatsapp || '').replace(/\D/g, '') === whatsapp);
       const now = new Date().toISOString();
       const lead = existing ? { ...existing, name: updated.customerName, lastService: updated.serviceName, updatedAt: now } : { id: randomUUID(), name: updated.customerName, whatsapp, lastService: updated.serviceName, lastBookingAt: updated.createdAt, createdAt: now, updatedAt: now };
-      await prisma.bioSite.update({ where: { id: request.params.id }, data: { content: { ...content, bookings: updatedBookings, leads: existing ? leads.map(item => item.id === existing.id ? lead : item) : [...leads, lead] } as Prisma.InputJsonValue } });
+      const operations: Prisma.PrismaPromise<unknown>[] = [
+        prisma.bioSite.update({ where: { id: request.params.id }, data: { content: { ...content, bookings: updatedBookings, leads: existing ? leads.map(item => item.id === existing.id ? lead : item) : [...leads, lead] } as Prisma.InputJsonValue } }),
+      ];
+      if (whatsapp.length >= 8 && whatsapp.length <= 15) {
+        operations.push(prisma.bioSiteLead.upsert({
+          where: { bioSiteId_phone: { bioSiteId: record.id, phone: whatsapp } },
+          update: { name: String(updated.customerName), requestedService: String(updated.serviceName), leadType: 'booking' },
+          create: {
+            id: typeof lead.id === 'string' ? lead.id : randomUUID(),
+            bioSiteId: record.id,
+            name: String(updated.customerName),
+            email: typeof updated.customerEmail === 'string' ? updated.customerEmail : null,
+            phone: whatsapp,
+            requestedService: String(updated.serviceName),
+            leadType: 'booking',
+          },
+        }));
+      }
+      await prisma.$transaction(operations);
     }
     response.json(updated);
   }
   catch (error) { response.status(404).json({ error: 'Não foi possível atualizar o agendamento.', detail: String(error) }); }
 });
 
+// ─── Leads ────────────────────────────────────────────────────────────────────
+
 app.post('/api/bio-sites/:id/leads', async (request, response) => {
-  const { name, whatsapp, lastService } = request.body || {};
-  if (typeof name !== 'string' || typeof whatsapp !== 'string') { response.status(400).json({ error: 'name e whatsapp são obrigatórios.' }); return; }
+  const { name, whatsapp, email, message, referralCode, leadType, lastService } = request.body || {};
+  const normalizedWhatsapp = typeof whatsapp === 'string' ? whatsapp.replace(/\D/g, '') : '';
+  if (
+    typeof name !== 'string' || !name.trim() || name.length > 120 ||
+    normalizedWhatsapp.length < 8 || normalizedWhatsapp.length > 15 ||
+    (email !== undefined && (typeof email !== 'string' || email.length > 254)) ||
+    (message !== undefined && (typeof message !== 'string' || message.length > 2000)) ||
+    (referralCode !== undefined && (typeof referralCode !== 'string' || referralCode.length > 100)) ||
+    (leadType !== undefined && !['quote', 'reseller', 'booking'].includes(leadType))
+  ) {
+    response.status(400).json({ error: 'Informe um nome e WhatsApp válidos. Os demais campos devem respeitar os limites permitidos.' });
+    return;
+  }
   try {
     const record = await prisma.bioSite.findUnique({ where: { id: request.params.id } });
     if (!record) { response.status(404).json({ error: 'Bio Site não encontrado.' }); return; }
     const content = record.content && typeof record.content === 'object' ? record.content as BioSitePayload : {};
     const leads = Array.isArray(content.leads) ? content.leads as Array<Record<string, unknown>> : [];
-    const normalized = whatsapp.replace(/\D/g, '');
-    const existing = leads.find(lead => String(lead.whatsapp || '').replace(/\D/g, '') === normalized);
+    const existing = leads.find(lead => String(lead.whatsapp || '').replace(/\D/g, '') === normalizedWhatsapp);
     const now = new Date().toISOString();
-    const lead = existing ? { ...existing, name, lastService, updatedAt: now } : { id: randomUUID(), name, whatsapp: normalized, lastService, createdAt: now, updatedAt: now };
+    const lead = existing
+      ? {
+          ...existing,
+          name: name.trim(),
+          email: typeof email === 'string' ? email.trim().toLowerCase() : existing.email,
+          message: typeof message === 'string' ? message.trim() : existing.message,
+          referralCode: typeof referralCode === 'string' ? referralCode.trim() : existing.referralCode,
+          leadType: typeof leadType === 'string' ? leadType : existing.leadType,
+          requestedService: typeof lastService === 'string' ? lastService.trim() : existing.requestedService,
+          lastService: typeof lastService === 'string' ? lastService.trim() : existing.lastService,
+          updatedAt: now,
+        }
+      : {
+          id: randomUUID(),
+          name: name.trim(),
+          whatsapp: normalizedWhatsapp,
+          email: typeof email === 'string' ? email.trim().toLowerCase() : undefined,
+          message: typeof message === 'string' ? message.trim() : undefined,
+          referralCode: typeof referralCode === 'string' ? referralCode.trim() : undefined,
+          leadType: typeof leadType === 'string' ? leadType : 'quote',
+          requestedService: typeof lastService === 'string' ? lastService.trim() : undefined,
+          lastService: typeof lastService === 'string' ? lastService.trim() : undefined,
+          createdAt: now,
+          updatedAt: now,
+        };
     const nextLeads = existing ? leads.map(item => item.id === existing.id ? lead : item) : [...leads, lead];
-    await prisma.bioSite.update({ where: { id: request.params.id }, data: { content: { ...content, leads: nextLeads } as Prisma.InputJsonValue } });
+    await prisma.$transaction([
+      prisma.bioSiteLead.upsert({
+        where: { bioSiteId_phone: { bioSiteId: record.id, phone: normalizedWhatsapp } },
+        update: {
+          name: name.trim(),
+          email: typeof email === 'string' ? email.trim().toLowerCase() : null,
+          message: typeof message === 'string' ? message.trim() : null,
+          referralCode: typeof referralCode === 'string' ? referralCode.trim() : null,
+          leadType: typeof leadType === 'string' ? leadType : 'quote',
+          requestedService: typeof lastService === 'string' ? lastService.trim() : null,
+        },
+        create: {
+          id: typeof lead.id === 'string' ? lead.id : randomUUID(),
+          bioSiteId: record.id,
+          name: name.trim(),
+          email: typeof email === 'string' ? email.trim().toLowerCase() : null,
+          phone: normalizedWhatsapp,
+          message: typeof message === 'string' ? message.trim() : null,
+          referralCode: typeof referralCode === 'string' ? referralCode.trim() : null,
+          leadType: typeof leadType === 'string' ? leadType : 'quote',
+          requestedService: typeof lastService === 'string' ? lastService.trim() : null,
+        },
+      }),
+      prisma.bioSite.update({ where: { id: request.params.id }, data: { content: { ...content, leads: nextLeads } as Prisma.InputJsonValue } }),
+    ]);
     response.status(201).json(lead);
   }
   catch (error) { response.status(404).json({ error: 'Não foi possível salvar o contato.', detail: String(error) }); }
 });
 
-app.delete('/api/bio-sites/:id/media', requireClientOrOwner, async (request: AuthenticatedRequest, response) => {
-  const url = String(request.query.url || '');
-  if (!url) { response.status(400).json({ error: 'url é obrigatório.' }); return; }
+app.post('/api/bio-sites/:id/referrals', async (request, response) => {
+  const { referralCode, eventType, referredUserId } = request.body || {};
+  if (
+    typeof referralCode !== 'string' || referralCode.length > 100 ||
+    !['visit', 'signup'].includes(eventType) ||
+    (eventType === 'signup' && (typeof referredUserId !== 'string' || !referredUserId.trim() || referredUserId.length > 100)) ||
+    (referredUserId !== undefined && (typeof referredUserId !== 'string' || referredUserId.length > 100))
+  ) {
+    response.status(400).json({ error: 'Dados de indicação inválidos.' });
+    return;
+  }
+
   try {
-    const site = await findEditableBioSite(request, request.params.id);
-    if (!site) { response.status(404).json({ error: 'Bio Site não encontrado.' }); return; }
-    const media = await prisma.bioSiteMedia.findFirst({ where: { bioSiteId: site.id, url } });
-    if (!media) { response.status(404).json({ error: 'Mídia não encontrada.' }); return; }
-    await removeBioSiteStorage([{ storageKey: media.storageKey, type: media.type }]);
-    await prisma.bioSiteMedia.delete({ where: { id: media.id } });
-    response.status(204).send();
+    const record = await prisma.bioSite.findUnique({ where: { id: request.params.id } });
+    if (!record || record.status === 'disabled' || record.status === 'archived') {
+      response.status(404).json({ error: 'Bio Site não encontrado.' });
+      return;
+    }
+    const content = record.content && typeof record.content === 'object' ? record.content as BioSitePayload : {};
+    const profile = content.resellerProfile && typeof content.resellerProfile === 'object'
+      ? content.resellerProfile as BioSitePayload
+      : {};
+    if (
+      profile.enabled !== true ||
+      profile.referralEnabled !== true ||
+      referralCode !== record.slug
+    ) {
+      response.status(400).json({ error: 'O link de indicação não está ativo ou não corresponde a este Bio Site.' });
+      return;
+    }
+
+    const referral = {
+      bioSiteId: record.id,
+      referralCode,
+      eventType,
+      referredUserId: typeof referredUserId === 'string' ? referredUserId.trim() : null,
+    };
+    const saved = eventType === 'signup'
+      ? await prisma.bioSiteReferral.upsert({
+          where: {
+            bioSiteId_eventType_referredUserId: {
+              bioSiteId: record.id,
+              eventType,
+              referredUserId: referral.referredUserId as string,
+            },
+          },
+          update: {},
+          create: { id: randomUUID(), ...referral },
+        })
+      : await prisma.bioSiteReferral.create({ data: { id: randomUUID(), ...referral } });
+    response.status(201).json({ id: saved.id, eventType: saved.eventType, createdAt: saved.createdAt.toISOString() });
   } catch (error) {
-    response.status(500).json({ error: 'Não foi possível remover a mídia.', detail: String(error) });
+    response.status(500).json({ error: 'Não foi possível registrar a indicação.', detail: String(error) });
   }
 });
+
+app.get('/api/bio-sites/:id/referrals/summary', requireActiveUser, async (request: AuthenticatedRequest, response) => {
+  const period = String(request.query.period || '7d');
+  if (!['7d', '30d', 'all'].includes(period)) {
+    response.status(400).json({ error: 'O período deve ser 7d, 30d ou all.' });
+    return;
+  }
+  try {
+    const site = await findEditableBioSite(request, request.params.id);
+    if (!site) {
+      response.status(404).json({ error: 'Bio Site não encontrado.' });
+      return;
+    }
+    const since = period === 'all' ? undefined : new Date(Date.now() - (period === '7d' ? 7 : 30) * 24 * 60 * 60 * 1000);
+    const counts = await prisma.bioSiteReferral.groupBy({
+      by: ['eventType'],
+      where: { bioSiteId: site.id, ...(since ? { createdAt: { gte: since } } : {}) },
+      _count: { _all: true },
+    });
+    response.json({
+      visits: counts.find(item => item.eventType === 'visit')?._count._all || 0,
+      signups: counts.find(item => item.eventType === 'signup')?._count._all || 0,
+    });
+  } catch (error) {
+    response.status(500).json({ error: 'Não foi possível carregar as métricas de indicação.', detail: String(error) });
+  }
+});
+
+// ─── Analytics ────────────────────────────────────────────────────────────────
+
+app.get('/api/analytics/events', requireClientOrOwner, async (request: AuthenticatedRequest, response) => {
+  const bioSiteId = String(request.query.bioSiteId || '');
+  if (!bioSiteId) {
+    response.status(400).json({ error: 'bioSiteId é obrigatório.' });
+    return;
+  }
+
+  try {
+    const record = await findEditableBioSite(request, bioSiteId);
+    if (!record) {
+      response.status(404).json({ error: 'Bio Site não encontrado.' });
+      return;
+    }
+    const content = record.content && typeof record.content === 'object' ? record.content as BioSitePayload : {};
+    response.json(Array.isArray(content.analyticsEvents) ? content.analyticsEvents : []);
+  } catch (error) {
+    response.status(500).json({ error: 'Não foi possível carregar os eventos.', detail: String(error) });
+  }
+});
+
+app.post('/api/analytics/events', async (request, response) => {
+  const { bioSiteId, type, targetId, targetLabel, device, referrer } = request.body || {};
+  if (typeof bioSiteId !== 'string' || typeof type !== 'string' || typeof device !== 'string') {
+    response.status(400).json({ error: 'bioSiteId, type e device são obrigatórios.' });
+    return;
+  }
+
+  try {
+    const record = await prisma.bioSite.findUnique({ where: { id: bioSiteId } });
+    if (!record) {
+      response.status(404).json({ error: 'Bio Site não encontrado.' });
+      return;
+    }
+
+    const content = record.content && typeof record.content === 'object' ? record.content as BioSitePayload : {};
+    const currentEvents = Array.isArray(content.analyticsEvents) ? content.analyticsEvents : [];
+    const event = {
+      id: randomUUID(),
+      bioSiteId,
+      type,
+      targetId,
+      targetLabel,
+      device,
+      referrer,
+      timestamp: new Date().toISOString(),
+    };
+    const nextEvents = [...currentEvents, event].slice(-5000);
+    await prisma.bioSite.update({
+      where: { id: bioSiteId },
+      data: { content: { ...content, analyticsEvents: nextEvents } as Prisma.InputJsonValue },
+    });
+    response.status(201).json(event);
+  } catch (error) {
+    response.status(500).json({ error: 'Não foi possível registrar o evento.', detail: String(error) });
+  }
+});
+
+// ─── PIX / WiFi ───────────────────────────────────────────────────────────────
+
+app.post('/api/pix/payload', (request, response) => {
+  const { pixKey, receiverName, city, amount, txId, description } = request.body || {};
+  if (typeof pixKey !== 'string' || !pixKey.trim()) {
+    response.status(400).json({ error: 'pixKey é obrigatório' });
+    return;
+  }
+
+  response.json({ payload: generatePixPayload({ pixKey, receiverName, city, amount, txId, description }) });
+});
+
+app.post('/api/wifi/payload', (request, response) => {
+  const { ssid, password, securityType, hidden } = request.body || {};
+  if (typeof ssid !== 'string' || !ssid.trim()) {
+    response.status(400).json({ error: 'ssid é obrigatório' });
+    return;
+  }
+
+  response.json({ payload: generateWifiPayload({ ssid, password, securityType, hidden }) });
+});
+
+// ─── Client Authentication ────────────────────────────────────────────────────
 
 app.post('/api/bio-sites/client/:key/authenticate', async (request, response) => {
   const { email, password } = request.body || {};
@@ -696,6 +1163,27 @@ app.post('/api/bio-sites/client/:key/authenticate', async (request, response) =>
     response.status(500).json({ error: 'Não foi possível autenticar o cliente.', detail: String(error) });
   }
 });
+
+app.post('/api/client-authenticate', async (request, response) => {
+  const { email, password } = request.body || {};
+  if (typeof email !== 'string' || typeof password !== 'string') {
+    response.status(400).json({ error: 'E-mail e senha são obrigatórios.' });
+    return;
+  }
+  try {
+    const result = await authenticateClientAccount(email, password);
+    if (!result) {
+      response.status(401).json({ error: 'E-mail ou senha do cliente inválidos.' });
+      return;
+    }
+    const content = result.site.content && typeof result.site.content === 'object' ? result.site.content as BioSitePayload : {};
+    response.json({ site: serializeBioSite(result.site), clientKey: content.clientEditKey || content.editKey, sessionToken: result.sessionToken, clientAccount: { id: result.account.id, name: result.account.name, email: result.account.email } });
+  } catch (error) {
+    response.status(500).json({ error: 'Não foi possível autenticar o cliente.', detail: String(error) });
+  }
+});
+
+// ─── Client Accounts ──────────────────────────────────────────────────────────
 
 app.delete('/api/client-accounts/:identifier', requireActiveUser, async (request, response) => {
   const identifier = decodeURIComponent(request.params.identifier).trim();
@@ -725,4 +1213,10 @@ app.delete('/api/client-accounts/:identifier', requireActiveUser, async (request
   } catch (error) {
     response.status(500).json({ error: 'Não foi possível excluir a conta do cliente e seus dados.', detail: String(error) });
   }
+});
+
+// ─── Start Server ─────────────────────────────────────────────────────────────
+
+app.listen(port, () => {
+  console.log(`NaBio backend running on http://localhost:${port}`);
 });
